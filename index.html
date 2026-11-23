@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>NEON SURVIVOR — built from one prompt</title>
+<style>
+  html, body { margin:0; padding:0; background:#07070f; height:100%; overflow:hidden; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#0a0a18; touch-action:none; }
+  #hint { position:fixed; left:0; right:0; bottom:10px; text-align:center; color:#5a5a7a;
+    font:12px/1.4 system-ui, sans-serif; pointer-events:none; letter-spacing:.08em; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<div id="hint">WASD / ARROWS / DRAG TO MOVE &nbsp;•&nbsp; AUTO-SHOOT &nbsp;•&nbsp; SURVIVE 3:00, BEAT THE BOSS</div>
+<script>
+'use strict';
+/* NEON SURVIVOR — a tiny top-down arena survivor, built from one prompt:
+   "Build a tiny arena survivor game: move with WASD, auto-shoot the nearest
+   enemy, collect XP, level up and pick 1 of 3 upgrades, survive 3 minutes
+   and beat the boss." One HTML file, no assets, no dependencies. */
+const CONFIG = {
+  playerSpeed: 260, playerRadius: 16, playerHp: 100,
+  bulletSpeed: 520, bulletDamage: 12, fireInterval: 0.45, bulletRadius: 5,
+  xpNextBase: 8, xpNextGrowth: 1.35,
+  spawnStart: 1.1, spawnMin: 0.22, spawnRamp: 0.985,
+  enemyTypes: {
+    chaser: { hp: 18, speed: 95,  radius: 14, xp: 1, damage: 8,  color: '#ff2d78', shape: 'tri' },
+    runner: { hp: 10, speed: 165, radius: 10, xp: 1, damage: 6,  color: '#ffd319', shape: 'dia' },
+    tank:   { hp: 70, speed: 55,  radius: 24, xp: 3, damage: 14, color: '#ff5c39', shape: 'sq'  },
+  },
+  boss: { hp: 900, speed: 70, radius: 46, xp: 25, damage: 20, color: '#b967ff', shape: 'hex' },
+  bossAt: 180, // seconds
+  upgrades: [
+    { id:'rate',   name:'RAPID FIRE',  desc:'+30% fire rate',        apply:g=>{g.fireInterval*=0.77;} },
+    { id:'multi',  name:'TWIN SHOT',   desc:'+1 bullet per volley',   apply:g=>{g.bulletsPerShot++;} },
+    { id:'pierce', name:'PIERCING',    desc:'bullets pass +1 enemy',  apply:g=>{g.pierce++;} },
+    { id:'speed',  name:'SWIFT BOOTS', desc:'+15% move speed',        apply:g=>{g.playerSpeed*=1.15;} },
+    { id:'magnet', name:'MAGNET',      desc:'+60% XP pickup range',   apply:g=>{g.magnet*=1.6;} },
+    { id:'shield', name:'AEGIS',       desc:'+25 max HP, heal 25',    apply:g=>{g.maxHp+=25; g.hp=Math.min(g.maxHp,g.hp+25);} },
+    { id:'nova',   name:'NOVA BURST',  desc:'damage pulse on level',  apply:() => { nova(); } },
+    { id:'dmg',    name:'HEAVY ROUNDS',desc:'+25% bullet damage',     apply:g=>{g.bulletDamage*=1.25;} },
+  ],
+};
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize); resize();
+
+/* ---------- audio (synthesized, no files) ---------- */
+let AC = null;
+function beep(freq, dur, type, vol) {
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    if (AC.state === 'suspended') AC.resume();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.04, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur);
+  } catch (e) { /* audio unavailable: play silently */ }
+}
+const sfx = {
+  shoot: () => beep(880, 0.06, 'square', 0.02),
+  hit:   () => beep(220, 0.08, 'sawtooth', 0.03),
+  die:   () => beep(160, 0.15, 'sawtooth', 0.05),
+  gem:   () => beep(1320, 0.07, 'sine', 0.04),
+  level: () => { beep(523, 0.1, 'sine', 0.05); setTimeout(() => beep(784, 0.14, 'sine', 0.05), 90); },
+  hurt:  () => beep(110, 0.2, 'sawtooth', 0.06),
+};
+
+/* ---------- state ---------- */
+const G = {
+  scene: 'menu', // menu | play | levelup | over | win
+  time: 0, score: 0, kills: 0, level: 1, xp: 0, xpNext: CONFIG.xpNextBase,
+  hp: CONFIG.playerHp, maxHp: CONFIG.playerHp,
+  playerSpeed: CONFIG.playerSpeed, fireInterval: CONFIG.fireInterval,
+  bulletDamage: CONFIG.bulletDamage, bulletsPerShot: 1, pierce: 0, magnet: 90,
+  player: { x: 0, y: 0, r: CONFIG.playerRadius, angle: -Math.PI / 2, hurtT: 0 },
+  enemies: [], bullets: [], gems: [], parts: [], texts: [],
+  fireT: 0, spawnT: 0, spawnInterval: CONFIG.spawnStart,
+  bossSpawned: false, bossDead: false,
+  shake: 0, choices: [], flash: 0,
+  best: 0,
+};
+try { G.best = parseInt(localStorage.getItem('neon-survivor-best') || '0', 10) || 0; } catch (e) {}
+function saveBest() { try { localStorage.setItem('neon-survivor-best', String(G.best)); } catch (e) {} }
+G.player.x = W / 2; G.player.y = H / 2;
+
+function reset() {
+  G.scene = 'play'; G.time = 0; G.score = 0; G.kills = 0; G.level = 1;
+  G.xp = 0; G.xpNext = CONFIG.xpNextBase; G.hp = CONFIG.playerHp; G.maxHp = CONFIG.playerHp;
+  G.playerSpeed = CONFIG.playerSpeed; G.fireInterval = CONFIG.fireInterval;
+  G.bulletDamage = CONFIG.bulletDamage; G.bulletsPerShot = 1; G.pierce = 0; G.magnet = 90;
+  G.player.x = W / 2; G.player.y = H / 2; G.player.hurtT = 0;
+  G.enemies = []; G.bullets = []; G.gems = []; G.parts = []; G.texts = [];
+  G.fireT = 0; G.spawnT = 0; G.spawnInterval = CONFIG.spawnStart;
+  G.bossSpawned = false; G.bossDead = false; G.shake = 0; G.flash = 0;
+}
+
+/* ---------- input (keyboard + touch unified to a move vector) ---------- */
+const keys = {};
+const touch = { active: false, sx: 0, sy: 0, dx: 0, dy: 0 };
+window.addEventListener('keydown', (e) => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === 'Enter' || e.key === ' ') {
+    if (G.scene === 'menu' || G.scene === 'over' || G.scene === 'win') { reset(); }
+  }
+  if (G.scene === 'levelup' && ['1', '2', '3'].includes(e.key)) pickUpgrade(+e.key - 1);
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+});
+window.addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener('touchstart', (e) => {
+  const t = e.touches[0]; touch.active = true; touch.sx = t.clientX; touch.sy = t.clientY; touch.dx = 0; touch.dy = 0;
+  if (G.scene === 'menu' || G.scene === 'over' || G.scene === 'win') reset();
+  e.preventDefault();
+}, { passive: false });
+canvas.addEventListener('touchmove', (e) => {
+  const t = e.touches[0]; touch.dx = t.clientX - touch.sx; touch.dy = t.clientY - touch.sy;
+  e.preventDefault();
+}, { passive: false });
+canvas.addEventListener('touchend', () => { touch.active = false; touch.dx = 0; touch.dy = 0; });
+canvas.addEventListener('mousedown', (e) => {
+  if (G.scene === 'menu' || G.scene === 'over' || G.scene === 'win') { reset(); return; }
+  if (G.scene === 'levelup') {
+    const i = Math.floor((e.clientY - (H / 2 - 30)) / 86);
+    if (i >= 0 && i < 3) pickUpgrade(i);
+  }
+});
+function moveVector() {
+  let x = 0, y = 0;
+  if (keys['a'] || keys['arrowleft']) x -= 1;
+  if (keys['d'] || keys['arrowright']) x += 1;
+  if (keys['w'] || keys['arrowup']) y -= 1;
+  if (keys['s'] || keys['arrowdown']) y += 1;
+  if (touch.active) { x += touch.dx / 40; y += touch.dy / 40; }
+  if (AUTO) { const v = autoPilot(); x = v.x; y = v.y; }
+  const len = Math.hypot(x, y);
+  if (len > 1) { x /= len; y /= len; }
+  return { x, y };
+}
+/* auto-pilot (for the demo recording): chase XP, flee close enemies */
+function autoPilot() {
+  let x = 0, y = 0, best = null, bd = 1e9;
+  for (const g of G.gems) { const d = Math.hypot(g.x - G.player.x, g.y - G.player.y); if (d < bd) { bd = d; best = g; } }
+  if (best) { x = (best.x - G.player.x) / (bd || 1); y = (best.y - G.player.y) / (bd || 1); }
+  for (const e of G.enemies) {
+    const d = Math.hypot(e.x - G.player.x, e.y - G.player.y);
+    if (d < 110) { x += (G.player.x - e.x) / (d || 1) * 1.5; y += (G.player.y - e.y) / (d || 1) * 1.5; }
+  }
+  const cx = W / 2 - G.player.x, cy = H / 2 - G.player.y;
+  if (Math.hypot(cx, cy) > 260) { x += cx * 0.002; y += cy * 0.002; }
+  return { x, y };
+}
+const AUTO = new URLSearchParams(location.search).has('auto');
+if (AUTO) document.getElementById('hint').style.display = 'none';
+
+/* ---------- spawning ---------- */
+function spawnEnemy(kind) {
+  const t = CONFIG.enemyTypes[kind] || CONFIG.enemyTypes.chaser;
+  const edge = Math.floor(Math.random() * 4);
+  let x, y;
+  if (edge === 0) { x = Math.random() * W; y = -30; }
+  else if (edge === 1) { x = W + 30; y = Math.random() * H; }
+  else if (edge === 2) { x = Math.random() * W; y = H + 30; }
+  else { x = -30; y = Math.random() * H; }
+  G.enemies.push({ kind, x, y, hp: t.hp, maxHp: t.hp, speed: t.speed, r: t.radius,
+    xp: t.xp, damage: t.damage, color: t.color, shape: t.shape, hitT: 0 });
+}
+function spawnBoss() {
+  const t = CONFIG.boss;
+  G.enemies.push({ kind: 'boss', x: W / 2, y: -60, hp: t.hp, maxHp: t.hp, speed: t.speed,
+    r: t.radius, xp: t.xp, damage: t.damage, color: t.color, shape: t.shape, hitT: 0 });
+  G.bossSpawned = true;
+  addText(W / 2, H / 2 - 60, 'THE BOSS HAS ARRIVED', '#b967ff', 28);
+}
+function pickKind() {
+  const r = Math.random(), t = G.time;
+  if (t > 90 && r < 0.22) return 'tank';
+  if (t > 35 && r < 0.5) return 'runner';
+  return 'chaser';
+}
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 60 + Math.random() * 180;
+    G.parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.5 + Math.random() * 0.3, color, r: 2 + Math.random() * 3 });
+  }
+}
+function addText(x, y, str, color, size) {
+  G.texts.push({ x, y, str, color, size: size || 16, life: 0.9 });
+}
+function nova() {
+  for (const e of G.enemies) damageEnemy(e, 40);
+  burst(G.player.x, G.player.y, '#2de2ff', 40);
+  G.shake = 10;
+}
+function damageEnemy(e, dmg) {
+  e.hp -= dmg; e.hitT = 0.08;
+  addText(e.x, e.y - e.r - 6, String(Math.round(dmg)), '#fff', 14);
+  if (e.hp <= 0) killEnemy(e);
+}
+function killEnemy(e) {
+  e.dead = true; G.kills++; G.score += e.kind === 'boss' ? 500 : 10;
+  burst(e.x, e.y, e.color, e.kind === 'boss' ? 60 : 14);
+  sfx.die();
+  for (let i = 0; i < e.xp; i++) {
+    G.gems.push({ x: e.x + (Math.random() - 0.5) * 30, y: e.y + (Math.random() - 0.5) * 30,
+      vx: (Math.random() - 0.5) * 60, vy: (Math.random() - 0.5) * 60, r: 5 });
+  }
+  if (e.kind === 'boss') { G.bossDead = true; G.scene = 'win'; if (G.score > G.best) { G.best = G.score; saveBest(); } }
+}
+function levelUp() {
+  G.level++; G.xp -= G.xpNext; G.xpNext = Math.round(G.xpNext * CONFIG.xpNextGrowth);
+  const pool = CONFIG.upgrades.slice();
+  G.choices = [];
+  for (let i = 0; i < 3; i++) G.choices.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+  G.scene = 'levelup'; sfx.level();
+}
+function pickUpgrade(i) {
+  const u = G.choices[i]; if (!u) return;
+  u.apply(G); G.scene = 'play';
+  addText(G.player.x, G.player.y - 30, u.name + '!', '#2de2ff', 20);
+}
+
+/* ---------- update ---------- */
+function update(dt) {
+  if (G.scene !== 'play') return;
+  G.time += dt;
+  const p = G.player;
+  const mv = moveVector();
+  p.x = Math.max(p.r, Math.min(W - p.r, p.x + mv.x * G.playerSpeed * dt));
+  p.y = Math.max(p.r, Math.min(H - p.r, p.y + mv.y * G.playerSpeed * dt));
+  if (mv.x || mv.y) p.angle = Math.atan2(mv.y, mv.x);
+  if (p.hurtT > 0) p.hurtT -= dt;
+
+  // spawn
+  G.spawnT -= dt;
+  if (G.spawnT <= 0) {
+    G.spawnT = G.spawnInterval;
+    G.spawnInterval = Math.max(CONFIG.spawnMin, G.spawnInterval * CONFIG.spawnRamp);
+    spawnEnemy(pickKind());
+    if (G.time > 120 && Math.random() < 0.3) spawnEnemy(pickKind());
+  }
+  if (!G.bossSpawned && G.time >= CONFIG.bossAt) spawnBoss();
+
+  // auto-shoot nearest enemy
+  G.fireT -= dt;
+  if (G.fireT <= 0 && G.enemies.length) {
+    let best = null, bd = 1e9;
+    for (const e of G.enemies) { const d = Math.hypot(e.x - p.x, e.y - p.y); if (d < bd) { bd = d; best = e; } }
+    if (best) {
+      G.fireT = G.fireInterval;
+      const base = Math.atan2(best.y - p.y, best.x - p.x);
+      const n = G.bulletsPerShot;
+      for (let i = 0; i < n; i++) {
+        const a = base + (i - (n - 1) / 2) * 0.14;
+        G.bullets.push({ x: p.x + Math.cos(a) * (p.r + 6), y: p.y + Math.sin(a) * (p.r + 6),
+          vx: Math.cos(a) * CONFIG.bulletSpeed, vy: Math.sin(a) * CONFIG.bulletSpeed,
+          r: CONFIG.bulletRadius, pierce: G.pierce });
+      }
+      sfx.shoot();
+    }
+  }
+
+  // bullets
+  for (const b of G.bullets) {
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    if (b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) { b.dead = true; continue; }
+    for (const e of G.enemies) {
+      if (e.dead) continue;
+      if (Math.hypot(e.x - b.x, e.y - b.y) < e.r + b.r) {
+        damageEnemy(e, G.bulletDamage);
+        if (b.pierce > 0) { b.pierce--; } else { b.dead = true; }
+        break;
+      }
+    }
+  }
+  G.bullets = G.bullets.filter((b) => !b.dead);
+
+  // enemies chase
+  for (const e of G.enemies) {
+    if (e.dead) continue;
+    const d = Math.hypot(p.x - e.x, p.y - e.y) || 1;
+    e.x += (p.x - e.x) / d * e.speed * dt;
+    e.y += (p.y - e.y) / d * e.speed * dt;
+    if (e.hitT > 0) e.hitT -= dt;
+    if (d < e.r + p.r) {
+      if (p.hurtT <= 0) {
+        G.hp -= e.damage; p.hurtT = 0.6; G.shake = 12; G.flash = 0.15; sfx.hurt();
+        burst(p.x, p.y, '#ff2d55', 10);
+        if (G.hp <= 0) {
+          G.hp = 0; G.scene = 'over';
+          burst(p.x, p.y, '#2de2ff', 50);
+          if (G.score > G.best) { G.best = G.score; saveBest(); }
+        }
+      }
+      // push enemy back so it does not stick
+      e.x -= (p.x - e.x) / d * 20; e.y -= (p.y - e.y) / d * 20;
+    }
+  }
+  G.enemies = G.enemies.filter((e) => !e.dead);
+
+  // gems: drift, magnet, collect
+  for (const g of G.gems) {
+    const d = Math.hypot(p.x - g.x, p.y - g.y) || 1;
+    if (d < G.magnet) { g.x += (p.x - g.x) / d * 320 * dt; g.y += (p.y - g.y) / d * 320 * dt; }
+    else { g.x += g.vx * dt; g.y += g.vy * dt; g.vx *= 0.98; g.vy *= 0.98; }
+    if (d < p.r + g.r + 4) {
+      g.dead = true; G.xp++; G.score += 2; sfx.gem();
+      if (G.xp >= G.xpNext) levelUp();
+    }
+  }
+  G.gems = G.gems.filter((g) => !g.dead);
+
+  // particles + floating texts
+  for (const pt of G.parts) { pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vx *= 0.96; pt.vy *= 0.96; pt.life -= dt; }
+  G.parts = G.parts.filter((pt) => pt.life > 0);
+  for (const t of G.texts) { t.y -= 40 * dt; t.life -= dt; }
+  G.texts = G.texts.filter((t) => t.life > 0);
+  if (G.shake > 0) G.shake *= Math.pow(0.001, dt);
+  if (G.flash > 0) G.flash -= dt;
+}
+
+/* ---------- render ---------- */
+function drawShape(shape, x, y, r, color, angle) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(angle || 0);
+  ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 14;
+  ctx.beginPath();
+  if (shape === 'tri') { ctx.moveTo(r, 0); ctx.lineTo(-r * 0.8, r * 0.8); ctx.lineTo(-r * 0.8, -r * 0.8); ctx.closePath(); }
+  else if (shape === 'dia') { ctx.moveTo(0, -r); ctx.lineTo(r, 0); ctx.lineTo(0, r); ctx.lineTo(-r, 0); ctx.closePath(); }
+  else if (shape === 'sq') { ctx.rect(-r * 0.8, -r * 0.8, r * 1.6, r * 1.6); }
+  else if (shape === 'hex') { for (let i = 0; i < 6; i++) { const a = i * Math.PI / 3; ctx[i ? 'lineTo' : 'moveTo'](Math.cos(a) * r, Math.sin(a) * r); } ctx.closePath(); }
+  else { ctx.arc(0, 0, r, 0, Math.PI * 2); }
+  ctx.fill(); ctx.restore();
+}
+function bar(x, y, w, h, frac, color, bg) {
+  ctx.fillStyle = bg || 'rgba(255,255,255,.12)';
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = color; ctx.fillRect(x, y, w * Math.max(0, Math.min(1, frac)), h);
+}
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  if (G.shake > 0.5) ctx.translate((Math.random() - 0.5) * G.shake, (Math.random() - 0.5) * G.shake);
+  // grid
+  ctx.strokeStyle = 'rgba(45,226,255,.06)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x < W; x += 48) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 0; y < H; y += 48) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+
+  if (G.scene === 'menu') {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#2de2ff'; ctx.shadowColor = '#2de2ff'; ctx.shadowBlur = 24;
+    ctx.font = 'bold 64px system-ui, sans-serif';
+    ctx.fillText('NEON', W / 2, H / 2 - 90);
+    ctx.fillStyle = '#ff2d78'; ctx.shadowColor = '#ff2d78';
+    ctx.fillText('SURVIVOR', W / 2, H / 2 - 20);
+    ctx.shadowBlur = 0; ctx.fillStyle = '#cfd2ff'; ctx.font = '20px system-ui, sans-serif';
+    ctx.fillText('One prompt. One game. Three minutes.', W / 2, H / 2 + 30);
+    ctx.fillStyle = '#ffd319'; ctx.font = 'bold 22px system-ui, sans-serif';
+    ctx.fillText(G.best > 0 ? 'BEST ' + G.best + '  •  PRESS ENTER / TAP TO PLAY' : 'PRESS ENTER / TAP TO PLAY', W / 2, H / 2 + 80);
+    ctx.restore(); return;
+  }
+
+  // gems
+  for (const g of G.gems) { ctx.fillStyle = '#2de2ff'; ctx.shadowColor = '#2de2ff'; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(g.x, g.y, g.r, 0, Math.PI * 2); ctx.fill(); }
+  ctx.shadowBlur = 0;
+  // enemies
+  for (const e of G.enemies) {
+    drawShape(e.shape, e.x, e.y, e.r, e.hitT > 0 ? '#ffffff' : e.color, Math.atan2(G.player.y - e.y, G.player.x - e.x));
+    if (e.maxHp > 30) bar(e.x - e.r, e.y - e.r - 10, e.r * 2, 4, e.hp / e.maxHp, '#ff2d55');
+  }
+  // bullets
+  for (const b of G.bullets) { ctx.fillStyle = '#ffe74c'; ctx.shadowColor = '#ffe74c'; ctx.shadowBlur = 12;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill(); }
+  ctx.shadowBlur = 0;
+  // player
+  const p = G.player;
+  if (!(p.hurtT > 0 && Math.floor(p.hurtT * 20) % 2 === 0)) {
+    drawShape('tri', p.x, p.y, p.r + 2, '#2de2ff', p.angle);
+    ctx.fillStyle = '#0a0a18'; ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.fill();
+  }
+  // particles
+  for (const pt of G.parts) { ctx.globalAlpha = Math.max(0, pt.life * 2); ctx.fillStyle = pt.color;
+    ctx.beginPath(); ctx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  // floating texts
+  ctx.textAlign = 'center';
+  for (const t of G.texts) { ctx.globalAlpha = Math.max(0, t.life); ctx.fillStyle = t.color;
+    ctx.font = 'bold ' + t.size + 'px system-ui, sans-serif'; ctx.fillText(t.str, t.x, t.y); }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // HUD
+  ctx.textAlign = 'left'; ctx.fillStyle = '#fff'; ctx.font = 'bold 18px system-ui, sans-serif';
+  ctx.fillText('SCORE ' + G.score, 16, 30);
+  ctx.fillText('LV ' + G.level, 16, 56);
+  const mm = Math.floor(G.time / 60), ss = Math.floor(G.time % 60);
+  ctx.textAlign = 'right';
+  ctx.fillText((mm < 10 ? '0' : '') + mm + ':' + (ss < 10 ? '0' : '') + ss, W - 16, 30);
+  ctx.fillText('KILLS ' + G.kills, W - 16, 56);
+  bar(16, H - 44, W - 32, 10, G.hp / G.maxHp, '#ff2d55');
+  bar(16, H - 28, W - 32, 6, G.xp / G.xpNext, '#2de2ff');
+  ctx.textAlign = 'center'; ctx.fillStyle = '#cfd2ff'; ctx.font = '12px system-ui, sans-serif';
+  ctx.fillText('HP', W / 2, H - 48);
+
+  if (G.scene === 'levelup') {
+    ctx.fillStyle = 'rgba(5,5,15,.78)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#ffd319'; ctx.font = 'bold 30px system-ui, sans-serif';
+    ctx.fillText('LEVEL UP!', W / 2, H / 2 - 130);
+    ctx.fillStyle = '#cfd2ff'; ctx.font = '16px system-ui, sans-serif';
+    ctx.fillText('Pick one upgrade  (tap or press 1 / 2 / 3)', W / 2, H / 2 - 96);
+    G.choices.forEach((u, i) => {
+      const y = H / 2 - 30 + i * 86;
+      ctx.fillStyle = 'rgba(45,226,255,.12)'; ctx.strokeStyle = '#2de2ff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.roundRect(W / 2 - 260, y, 520, 72, 12); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 20px system-ui, sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText((i + 1) + '.  ' + u.name, W / 2 - 240, y + 30);
+      ctx.fillStyle = '#9be8ff'; ctx.font = '16px system-ui, sans-serif';
+      ctx.fillText(u.desc, W / 2 - 240, y + 54);
+    });
+  }
+  if (G.scene === 'over' || G.scene === 'win') {
+    ctx.fillStyle = 'rgba(5,5,15,.8)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = G.scene === 'win' ? '#2de2ff' : '#ff2d55';
+    ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 24;
+    ctx.font = 'bold 56px system-ui, sans-serif';
+    ctx.fillText(G.scene === 'win' ? 'YOU WIN!' : 'GAME OVER', W / 2, H / 2 - 40);
+    ctx.shadowBlur = 0; ctx.fillStyle = '#fff'; ctx.font = '22px system-ui, sans-serif';
+    ctx.fillText('Score ' + G.score + '  •  Level ' + G.level + '  •  Kills ' + G.kills, W / 2, H / 2 + 8);
+    ctx.fillStyle = '#ffd319'; ctx.font = 'bold 20px system-ui, sans-serif';
+    ctx.fillText('BEST ' + G.best + '   —   PRESS ENTER / TAP TO PLAY AGAIN', W / 2, H / 2 + 52);
+  }
+  if (G.flash > 0) { ctx.fillStyle = 'rgba(255,45,85,' + (G.flash * 1.5) + ')'; ctx.fillRect(0, 0, W, H); }
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  if (AUTO && G.scene === 'levelup') {
+    G._autoLv = (G._autoLv || 0) + dt;
+    if (G._autoLv > 1.2) { G._autoLv = 0; try { pickUpgrade(Math.floor(Math.random() * 3)); } catch (e) { G.scene = 'play'; } }
+  }
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+if (AUTO) reset();
+requestAnimationFrame(loop);
+window.__game = G;
+window.__reset = reset;
+</script>
+</body>
+</html>
